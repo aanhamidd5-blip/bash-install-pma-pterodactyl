@@ -12,15 +12,16 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+PTERO_DIR="/var/www/pterodactyl"
+PTERO_ENV="$PTERO_DIR/.env"
 PMA_DIR="/usr/share/phpmyadmin"
-PMA_MARKER="CIRGANTENG-PMA-START"
 BACKUP_DIR="/root/cirganteng-pma-backups"
 
 clear
 
 echo -e "${CYAN}"
 echo "=================================================="
-echo "             CIRGANTENG PMA INSTALLER"
+echo "          CIRGANTENG PMA INSTALLER"
 echo "=================================================="
 echo -e "${NC}"
 
@@ -32,6 +33,10 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[!] Jalankan sebagai root.${NC}"
     exit 1
 fi
+
+# ============================================================
+# OS CHECK
+# ============================================================
 
 if [ ! -f /etc/os-release ]; then
     echo -e "${RED}[!] OS tidak dapat dideteksi.${NC}"
@@ -53,31 +58,20 @@ esac
 echo -e "${GREEN}[✓] OS: $PRETTY_NAME${NC}"
 
 # ============================================================
-# CEK NGINX
+# CEK PTERODACTYL
 # ============================================================
-
-if ! command -v nginx >/dev/null 2>&1; then
-    echo -e "${YELLOW}[!] Nginx belum ada. Menginstall...${NC}"
-    apt-get update -y
-    apt-get install -y nginx
-fi
-
-# ============================================================
-# CARI DOMAIN PTERODACTYL
-# ============================================================
-
-PTERO_DIR="/var/www/pterodactyl"
-PTERO_ENV="$PTERO_DIR/.env"
-PANEL_DOMAIN=""
 
 if [ ! -f "$PTERO_ENV" ]; then
-    echo -e "${RED}[!] File Pterodactyl tidak ditemukan:${NC}"
+    echo -e "${RED}[!] Pterodactyl tidak ditemukan:${NC}"
     echo "$PTERO_ENV"
     exit 1
 fi
 
-PANEL_URL=$(grep -E '^APP_URL=' "$PTERO_ENV" | head -1 | cut -d= -f2-)
+# ============================================================
+# AMBIL DOMAIN DARI APP_URL
+# ============================================================
 
+PANEL_URL=$(grep -E '^APP_URL=' "$PTERO_ENV" | head -1 | cut -d= -f2-)
 PANEL_URL=$(printf '%s' "$PANEL_URL" | tr -d '"' | tr -d "'")
 
 if [ -z "$PANEL_URL" ]; then
@@ -95,40 +89,51 @@ if [ -z "$PANEL_DOMAIN" ]; then
     exit 1
 fi
 
-echo -e "${GREEN}[✓] Domain panel : $PANEL_DOMAIN${NC}"
+echo -e "${GREEN}[✓] Domain panel: $PANEL_DOMAIN${NC}"
+
+# ============================================================
+# CEK / INSTALL NGINX
+# ============================================================
+
+if ! command -v nginx >/dev/null 2>&1; then
+    echo -e "${YELLOW}[!] Nginx belum ada. Menginstall...${NC}"
+
+    apt-get update -y
+    apt-get install -y nginx
+fi
 
 # ============================================================
 # CARI CONFIG NGINX PANEL
 # ============================================================
 
-NGINX_PANEL_CONF=""
+NGINX_CONF=""
 
 for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
     [ -f "$conf" ] || continue
 
     if grep -qE "server_name[[:space:]].*${PANEL_DOMAIN}" "$conf" 2>/dev/null; then
-        NGINX_PANEL_CONF="$conf"
+        NGINX_CONF="$conf"
         break
     fi
 done
 
-if [ -z "$NGINX_PANEL_CONF" ]; then
+if [ -z "$NGINX_CONF" ]; then
     for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
         [ -f "$conf" ] || continue
 
-        if grep -qE 'pterodactyl|/var/www/pterodactyl|public/index.php' "$conf" 2>/dev/null; then
-            NGINX_PANEL_CONF="$conf"
+        if grep -qE '/var/www/pterodactyl|pterodactyl' "$conf" 2>/dev/null; then
+            NGINX_CONF="$conf"
             break
         fi
     done
 fi
 
-if [ -z "$NGINX_PANEL_CONF" ]; then
+if [ -z "$NGINX_CONF" ]; then
     echo -e "${RED}[!] Config Nginx Pterodactyl tidak ditemukan.${NC}"
     exit 1
 fi
 
-echo -e "${GREEN}[✓] Nginx config : $NGINX_PANEL_CONF${NC}"
+echo -e "${GREEN}[✓] Config Nginx: $NGINX_CONF${NC}"
 
 # ============================================================
 # BACKUP
@@ -136,42 +141,25 @@ echo -e "${GREEN}[✓] Nginx config : $NGINX_PANEL_CONF${NC}"
 
 mkdir -p "$BACKUP_DIR"
 
-BACKUP_FILE="$BACKUP_DIR/pterodactyl.conf.$(date +%Y%m%d-%H%M%S).bak"
+BACKUP_FILE="$BACKUP_DIR/pterodactyl-$(date +%Y%m%d-%H%M%S).bak"
 
-cp -a "$NGINX_PANEL_CONF" "$BACKUP_FILE"
+cp -a "$NGINX_CONF" "$BACKUP_FILE"
 
 echo -e "${GREEN}[✓] Backup dibuat:${NC}"
 echo "$BACKUP_FILE"
 
 # ============================================================
-# UPDATE PACKAGE
+# INSTALL PHPMyAdmin
 # ============================================================
 
 echo
-echo -e "${YELLOW}[1/7] Update package...${NC}"
+echo -e "${YELLOW}[1/6] Install PHPMyAdmin...${NC}"
 
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
 
-# ============================================================
-# CATAT STATUS APACHE
-# ============================================================
-
-APACHE_EXISTED="no"
-
-if dpkg-query -W -f='${Status}' apache2 2>/dev/null | grep -q "install ok installed"; then
-    APACHE_EXISTED="yes"
-fi
-
-# ============================================================
-# INSTALL PHP + PHPMYADMIN
-# ============================================================
-
-echo
-echo -e "${YELLOW}[2/7] Install PHPMyAdmin...${NC}"
-
-apt-get install -y --no-install-recommends \
+apt-get install -y \
     phpmyadmin \
     php-mysql \
     php-mbstring \
@@ -181,12 +169,9 @@ apt-get install -y --no-install-recommends \
     php-xml \
     php-bcmath \
     php-intl \
-    unzip \
+    php-fpm \
     curl \
     ca-certificates
-
-# Pastikan PHP-FPM tersedia
-apt-get install -y --no-install-recommends php-fpm
 
 if [ ! -d "$PMA_DIR" ]; then
     echo -e "${RED}[!] PHPMyAdmin gagal terinstall.${NC}"
@@ -196,45 +181,14 @@ fi
 echo -e "${GREEN}[✓] PHPMyAdmin terinstall.${NC}"
 
 # ============================================================
-# MATIKAN APACHE JIKA TERPASANG OLEH INSTALLER
-# ============================================================
-
-if [ "$APACHE_EXISTED" = "no" ] && dpkg-query -W -f='${Status}' apache2 2>/dev/null | grep -q "install ok installed"; then
-
-    echo
-    echo -e "${YELLOW}[3/7] Menghapus Apache yang ikut terpasang...${NC}"
-
-    systemctl stop apache2 2>/dev/null || true
-    systemctl disable apache2 2>/dev/null || true
-
-    apt-get purge -y \
-        apache2 \
-        apache2-bin \
-        apache2-data \
-        apache2-utils \
-        libapache2-mod-php8.4 \
-        libapache2-mod-php8.3 \
-        2>/dev/null || true
-
-    apt-get autoremove -y 2>/dev/null || true
-
-    echo -e "${GREEN}[✓] Apache tidak digunakan.${NC}"
-
-else
-    echo
-    echo -e "${YELLOW}[3/7] Apache tidak diubah.${NC}"
-fi
-
-# ============================================================
 # CARI PHP-FPM SOCKET
 # ============================================================
 
 echo
-echo -e "${YELLOW}[4/7] Mendeteksi PHP-FPM...${NC}"
+echo -e "${YELLOW}[2/6] Mendeteksi PHP-FPM...${NC}"
 
 PHP_SOCKET=""
 
-# Cari socket aktif
 for socket in /run/php/php*-fpm.sock; do
     if [ -S "$socket" ]; then
         PHP_SOCKET="$socket"
@@ -243,12 +197,13 @@ for socket in /run/php/php*-fpm.sock; do
 done
 
 if [ -z "$PHP_SOCKET" ]; then
-    echo -e "${YELLOW}[!] PHP-FPM socket belum ditemukan, mencoba restart...${NC}"
 
-    systemctl restart php8.4-fpm 2>/dev/null || true
-    systemctl restart php8.3-fpm 2>/dev/null || true
-    systemctl restart php8.2-fpm 2>/dev/null || true
-    systemctl restart php8.1-fpm 2>/dev/null || true
+    echo -e "${YELLOW}[!] Socket PHP-FPM belum ditemukan.${NC}"
+    echo "    Mencoba restart PHP-FPM..."
+
+    for service in php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm; do
+        systemctl restart "$service" 2>/dev/null || true
+    done
 
     for socket in /run/php/php*-fpm.sock; do
         if [ -S "$socket" ]; then
@@ -270,148 +225,132 @@ echo -e "${GREEN}[✓] PHP-FPM: $PHP_SOCKET${NC}"
 # ============================================================
 
 echo
-echo -e "${YELLOW}[5/7] Menyiapkan konfigurasi /pma...${NC}"
+echo -e "${YELLOW}[3/6] Membersihkan konfigurasi PMA lama...${NC}"
 
-python3 - "$NGINX_PANEL_CONF" "$PMA_MARKER" <<'PY'
+python3 - "$NGINX_CONF" <<'PY'
 import sys
 
 path = sys.argv[1]
-marker = sys.argv[2]
 
 with open(path, "r", encoding="utf-8") as f:
     data = f.read()
 
-start = data.find(marker)
+pairs = [
+    ("# CIRGANTENG-PMA-START", "# CIRGANTENG-PMA-END"),
+    ("# === CIRGANTENG-PMA-START ===", "# === CIRGANTENG-PMA-END ==="),
+    ("# === CIRGANTENG-PMA-START ===", "# CIRGANTENG-PMA-END"),
+]
 
-if start != -1:
-    start = data.rfind("#", 0, start)
+changed = False
 
-    end_marker = "# CIRGANTENG-PMA-END"
+for start_marker, end_marker in pairs:
+    while start_marker in data:
 
-    end = data.find(end_marker, start)
+        start = data.find(start_marker)
 
-    if end != -1:
-        end = data.find("\n", end)
+        line_start = data.rfind("\n", 0, start) + 1
+
+        end = data.find(end_marker, start)
 
         if end == -1:
-            end = len(data)
+            break
 
-        data = data[:start] + data[end + 1:]
+        end += len(end_marker)
 
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(data)
+        if end < len(data) and data[end] == "\n":
+            end += 1
 
-        print("[✓] Config PMA lama dihapus.")
-    else:
-        print("[!] Marker lama tidak lengkap, tidak diubah.")
+        data = data[:line_start] + data[end:]
+
+        changed = True
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(data)
+
+if changed:
+    print("[✓] Config PMA lama dibersihkan.")
 else:
     print("[✓] Tidak ada config PMA lama.")
 PY
 
 # ============================================================
-# MASUKKAN LOCATION KE DALAM SERVER BLOCK
+# PASANG ROUTE /PMA
 # ============================================================
 
-echo -e "${YELLOW}[6/7] Memasang route /pma ke Nginx...${NC}"
+echo
+echo -e "${YELLOW}[4/6] Memasang route /pma...${NC}"
 
-python3 - "$NGINX_PANEL_CONF" "$PHP_SOCKET" "$PMA_DIR" "$PMA_MARKER" <<'PY'
+python3 - "$NGINX_CONF" "$PHP_SOCKET" "$PMA_DIR" <<'PY'
 import sys
 
 path = sys.argv[1]
 php_socket = sys.argv[2]
 pma_dir = sys.argv[3]
-marker = sys.argv[4]
 
 with open(path, "r", encoding="utf-8") as f:
     data = f.read()
 
-block = f'''
-    # {marker}
+# Cari server block
+server_pos = data.find("server")
 
-    # PHPMyAdmin CIRGANTENG
-    # URL: /pma
-
-    location = /pma {{
-        return 301 /pma/;
-    }}
-
-    location /pma/ {{
-        alias {pma_dir}/;
-        index index.php;
-    }}
-
-    location ~ ^/pma/(.+\\.php)$ {{
-        alias {pma_dir}/$1;
-
-        include snippets/fastcgi-php.conf;
-
-        fastcgi_param SCRIPT_FILENAME {pma_dir}/$1;
-        fastcgi_param SCRIPT_NAME /pma/$1;
-        fastcgi_param REQUEST_URI $request_uri;
-
-        fastcgi_pass unix:{php_socket};
-    }}
-
-    location ~ ^/pma/(.+\\.(?:css|js|jpg|jpeg|gif|png|ico|svg|woff|woff2|ttf|html|xml|txt))$ {{
-        alias {pma_dir}/$1;
-    }}
-
-    # CIRGANTENG-PMA-END
-'''
-
-# ------------------------------------------------------------
-# Cari server { pertama dan matching closing brace.
-# Mengabaikan komentar dan string sederhana.
-# ------------------------------------------------------------
-
-server_start = data.find("server")
-if server_start == -1:
+if server_pos == -1:
     raise SystemExit("server block tidak ditemukan.")
 
-brace_start = data.find("{", server_start)
-if brace_start == -1:
+open_pos = data.find("{", server_pos)
+
+if open_pos == -1:
     raise SystemExit("Pembuka server block tidak ditemukan.")
 
 depth = 0
+close_pos = -1
+
+in_comment = False
 in_single = False
 in_double = False
-in_comment = False
 escape = False
-end_pos = -1
 
-i = brace_start
+i = open_pos
 
 while i < len(data):
+
     c = data[i]
-    n = data[i + 1] if i + 1 < len(data) else ""
 
     if in_comment:
         if c == "\n":
             in_comment = False
+
         i += 1
         continue
 
     if in_single:
+
         if escape:
             escape = False
+
         elif c == "\\":
             escape = True
+
         elif c == "'":
             in_single = False
+
         i += 1
         continue
 
     if in_double:
+
         if escape:
             escape = False
+
         elif c == "\\":
             escape = True
+
         elif c == '"':
             in_double = False
+
         i += 1
         continue
 
-    if c == "#" :
+    if c == "#":
         in_comment = True
         i += 1
         continue
@@ -430,49 +369,92 @@ while i < len(data):
         depth += 1
 
     elif c == "}":
+
         depth -= 1
 
         if depth == 0:
-            end_pos = i
+            close_pos = i
             break
 
     i += 1
 
-if end_pos == -1:
+if close_pos == -1:
     raise SystemExit("Closing server block tidak ditemukan.")
 
-new_data = data[:end_pos] + "\n" + block + "\n" + data[end_pos:]
+block = f'''
+
+    # CIRGANTENG-PMA-START
+
+    # PHPMyAdmin
+    # URL: /pma/
+
+    location = /pma {{
+        return 301 /pma/;
+    }}
+
+    location /pma/ {{
+        alias {pma_dir}/;
+        index index.php;
+    }}
+
+    location ~ ^/pma/(.+\\.php)$ {{
+        alias {pma_dir}/$1;
+
+        include fastcgi_params;
+
+        fastcgi_param SCRIPT_FILENAME {pma_dir}/$1;
+        fastcgi_param SCRIPT_NAME /pma/$1;
+        fastcgi_param REQUEST_URI $request_uri;
+
+        fastcgi_pass unix:{php_socket};
+    }}
+
+    # CIRGANTENG-PMA-END
+'''
+
+data = data[:close_pos] + block + "\n" + data[close_pos:]
 
 with open(path, "w", encoding="utf-8") as f:
-    f.write(new_data)
+    f.write(data)
 
-print("[✓] Route /pma berhasil dimasukkan.")
+print("[✓] Route /pma berhasil dipasang.")
 PY
+
+# ============================================================
+# PERMISSION
+# ============================================================
+
+echo
+echo -e "${YELLOW}[5/6] Menyiapkan permission...${NC}"
+
+chown -R root:root "$PMA_DIR"
+
+find "$PMA_DIR" -type d -exec chmod 755 {} \;
+find "$PMA_DIR" -type f -exec chmod 644 {} \;
+
+echo -e "${GREEN}[✓] Permission selesai.${NC}"
 
 # ============================================================
 # TEST NGINX
 # ============================================================
 
 echo
-echo -e "${YELLOW}[7/7] Test konfigurasi Nginx...${NC}"
+echo -e "${YELLOW}[6/6] Test konfigurasi Nginx...${NC}"
 
 if ! nginx -t; then
 
     echo
     echo -e "${RED}=================================================="
-    echo "[!] NGINX ERROR"
+    echo " NGINX ERROR - ROLLBACK"
     echo "==================================================${NC}"
 
-    echo
-    echo "Rollback otomatis..."
+    cp -f "$BACKUP_FILE" "$NGINX_CONF"
 
-    cp -f "$BACKUP_FILE" "$NGINX_PANEL_CONF"
+    echo
+    echo "Config dikembalikan ke backup:"
+    echo "$BACKUP_FILE"
 
     nginx -t || true
-
-    echo
-    echo -e "${YELLOW}Backup:${NC}"
-    echo "$BACKUP_FILE"
 
     exit 1
 fi
@@ -484,17 +466,19 @@ echo -e "${GREEN}[✓] Nginx configuration OK.${NC}"
 # ============================================================
 
 for service in php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm; do
-    if systemctl list-unit-files "$service" 2>/dev/null | grep -q "$service"; then
+
+    if systemctl list-unit-files "$service" >/dev/null 2>&1; then
         systemctl restart "$service" 2>/dev/null || true
     fi
+
 done
 
 # ============================================================
-# RESTART NGINX
+# RELOAD NGINX
 # ============================================================
 
 systemctl enable nginx >/dev/null 2>&1 || true
-systemctl restart nginx
+systemctl reload nginx
 
 # ============================================================
 # SELESAI
@@ -516,11 +500,12 @@ echo -e "${CYAN}PHPMyAdmin:${NC}"
 echo "https://$PANEL_DOMAIN/pma/"
 
 echo
-echo -e "${YELLOW}Login menggunakan akun MySQL/MariaDB.${NC}"
+echo -e "${CYAN}PHP-FPM:${NC}"
+echo "$PHP_SOCKET"
 
 echo
 echo -e "${CYAN}Backup Nginx:${NC}"
 echo "$BACKUP_FILE"
 
 echo
-echo "=================================================="
+echo -e "${GREEN}Selesai.${NC}"
