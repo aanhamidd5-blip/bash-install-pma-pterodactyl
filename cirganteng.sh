@@ -34,7 +34,7 @@ SERVER_FILE=""
 for FILE in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
     [[ -f "$FILE" ]] || continue
 
-    if grep -qE 'server_name[[:space:]]+' "$FILE" 2>/dev/null; then
+    if grep -qE '^[[:space:]]*server_name[[:space:]]+' "$FILE" 2>/dev/null; then
         SERVER_FILE="$FILE"
         break
     fi
@@ -45,23 +45,22 @@ done
 ok "Config Nginx : $SERVER_FILE"
 
 # ============================================================
-# DETEKSI DOMAIN - SEDERHANA
+# DETEKSI DOMAIN TANPA AWK
 # ============================================================
 
 DOMAIN="$(
     grep -hE '^[[:space:]]*server_name[[:space:]]+' "$SERVER_FILE" 2>/dev/null |
     head -n1 |
     sed -E 's/^[[:space:]]*server_name[[:space:]]+//' |
-    sed 's/;.*//' |
-    sed -E 's/[[:space:]].*$//' |
-    sed 's/^\\*\\.//' |
-    sed 's/[[:space:]]//g'
+    sed -E 's/[;[:space:]].*$//' |
+    sed 's/^\*\.//' |
+    tr -d '\r'
 )"
 
 [[ -n "$DOMAIN" ]] || die "Domain tidak ditemukan dari server_name."
 
 case "$DOMAIN" in
-    "_"|"localhost"|"127.0.0.1"|"\$"*|"*")
+    "_"|"localhost"|"127.0.0.1"|"0.0.0.0"|"*")
         die "server_name tidak berisi domain publik: $DOMAIN"
         ;;
 esac
@@ -69,45 +68,35 @@ esac
 ok "Domain terdeteksi : $DOMAIN"
 
 # ============================================================
-# DETEKSI PHP-FPM
+# PHP 8.3
 # ============================================================
 
-PHP_FPM_SOCKET=""
-
-for SOCK in /run/php/php*-fpm.sock; do
-    [[ -S "$SOCK" ]] || continue
-    PHP_FPM_SOCKET="$SOCK"
-    break
-done
-
-[[ -n "$PHP_FPM_SOCKET" ]] || die "Socket PHP-FPM tidak ditemukan."
-
-PHP_VERSION="$(
-    basename "$PHP_FPM_SOCKET" |
-    sed -E 's/^php([0-9.]+)-fpm\.sock$/\1/'
-)"
-
-[[ -n "$PHP_VERSION" ]] || die "Versi PHP-FPM tidak dapat dideteksi."
-
+PHP_VERSION="8.3"
 PHP_BIN="/usr/bin/php8.3"
+PHP_FPM_SOCKET="/run/php/php8.3-fpm.sock"
 
-if [[ ! -x "$PHP_BIN" ]]; then
-    die "PHP 8.3 CLI tidak ditemukan: $PHP_BIN"
-fi
+command -v "$PHP_BIN" >/dev/null 2>&1 ||
+    die "PHP 8.3 tidak ditemukan."
 
-ok "PHP-FPM : $PHP_VERSION"
-ok "Socket  : $PHP_FPM_SOCKET"
+[[ -S "$PHP_FPM_SOCKET" ]] ||
+    die "Socket PHP-FPM 8.3 tidak ditemukan: $PHP_FPM_SOCKET"
+
+systemctl is-active --quiet php8.3-fpm ||
+    die "php8.3-fpm tidak aktif."
+
+ok "PHP CLI  : $("$PHP_BIN" -r 'echo PHP_VERSION;')"
+ok "PHP-FPM  : $PHP_FPM_SOCKET"
 
 # ============================================================
-# CEK EXTENSION
+# CEK EXTENSION PHP 8.3
 # ============================================================
 
-log "Cek extension PHP..."
+log "Cek extension PHP 8.3..."
 
 MISSING=()
 
 for EXT in mysqli mbstring zip; do
-    if /usr/bin/php8.3 -m 2>/dev/null | grep -qi "^${EXT}$"; then
+    if "$PHP_BIN" -r "exit(extension_loaded('$EXT') ? 0 : 1);"; then
         ok "Extension $EXT tersedia"
     else
         warn "Extension $EXT belum tersedia"
@@ -116,13 +105,14 @@ for EXT in mysqli mbstring zip; do
 done
 
 # ============================================================
-# INSTALL EXTENSION
+# INSTALL EXTENSION JIKA KURANG
 # ============================================================
 
 if (( ${#MISSING[@]} > 0 )); then
-    log "Menginstall extension PHP ${PHP_VERSION}..."
+    log "Menginstall extension PHP 8.3..."
 
     export DEBIAN_FRONTEND=noninteractive
+
     apt-get update -o Acquire::Retries=3
 
     PACKAGES=()
@@ -130,30 +120,32 @@ if (( ${#MISSING[@]} > 0 )); then
     for EXT in "${MISSING[@]}"; do
         case "$EXT" in
             mysqli)
-                PACKAGES+=("php${PHP_VERSION}-mysql")
+                PACKAGES+=("php8.3-mysql")
                 ;;
             mbstring)
-                PACKAGES+=("php${PHP_VERSION}-mbstring")
+                PACKAGES+=("php8.3-mbstring")
                 ;;
             zip)
-                PACKAGES+=("php${PHP_VERSION}-zip")
+                PACKAGES+=("php8.3-zip")
                 ;;
         esac
     done
 
     apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 
-    systemctl restart "php${PHP_VERSION}-fpm"
+    systemctl restart php8.3-fpm
 
     log "Verifikasi extension..."
 
     for EXT in mysqli mbstring zip; do
-        /usr/bin/php8.3 -m 2>/dev/null | grep -qi "^${EXT}$" ||
+        "$PHP_BIN" -r "exit(extension_loaded('$EXT') ? 0 : 1);" ||
             die "Extension $EXT masih belum aktif setelah instalasi."
-    done
-fi
 
-ok "Semua extension utama tersedia."
+        ok "Extension $EXT aktif"
+    done
+else
+    ok "Semua extension utama tersedia."
+fi
 
 # ============================================================
 # BACKUP NGINX
@@ -191,21 +183,35 @@ ok "Archive valid."
 
 TMP_EXTRACT="$(mktemp -d)"
 
+cleanup(){
+    rm -rf "$TMP_EXTRACT"
+}
+trap cleanup EXIT
+
 tar -xzf "$PMA_ARCHIVE" -C "$TMP_EXTRACT"
 
-PMA_SOURCE="$(find "$TMP_EXTRACT" -maxdepth 1 -type d -name 'phpMyAdmin-*' | head -n1)"
+PMA_SOURCE="$(
+    find "$TMP_EXTRACT" \
+        -maxdepth 1 \
+        -type d \
+        -name 'phpMyAdmin-*' |
+    head -n1
+)"
 
-[[ -d "$PMA_SOURCE" ]] || die "Folder phpMyAdmin tidak ditemukan."
+[[ -d "$PMA_SOURCE" ]] ||
+    die "Folder phpMyAdmin tidak ditemukan."
 
 rm -rf "$PMA_DIR"
 
 mkdir -p "$PMA_DIR"
+
 cp -a "$PMA_SOURCE"/. "$PMA_DIR"/
 
 mkdir -p "$PMA_TMP"
+
 chown -R www-data:www-data "$PMA_TMP"
 
-rm -rf "$TMP_EXTRACT" "$PMA_ARCHIVE"
+rm -f "$PMA_ARCHIVE"
 
 ok "phpMyAdmin terpasang di $PMA_DIR"
 
@@ -244,45 +250,87 @@ ok "config.inc.php siap."
 
 # ============================================================
 # NGINX /PMA/
+# TANPA AWK
 # ============================================================
 
-if grep -qE 'location[[:space:]]+(/|\^~[[:space:]]*)/pma/' "$SERVER_FILE" 2>/dev/null; then
-    warn "Location /pma/ sudah ada. Tidak dibuat ulang."
-else
-    NGINX_TMP="$(mktemp)"
+if grep -q "CIRGANTENG-PMA-START" "$SERVER_FILE" 2>/dev/null; then
+    warn "Konfigurasi PMA lama ditemukan. Membersihkan block lama."
 
-    awk -v socket="$PHP_FPM_SOCKET" '
-    BEGIN { inserted=0 }
+    python3 - "$SERVER_FILE" <<'PY'
+import sys
+from pathlib import Path
 
-    /^[[:space:]]*server[[:space:]]*\{/ && inserted==0 {
-        print
-        print ""
-        print "    # CIRGANTENG PHPMYADMIN"
-        print "    location ^~ /pma/ {"
-        print "        alias /usr/share/phpmyadmin/;"
-        print "        index index.php;"
-        print "    }"
-        print ""
-        print "    location ~ ^/pma/(.+\\.php)$ {"
-        print "        alias /usr/share/phpmyadmin/$1;"
-        print "        include fastcgi_params;"
-        print "        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;"
-        print "        fastcgi_param SCRIPT_NAME /pma/$1;"
-        print "        fastcgi_pass unix:" socket ";"
-        print "    }"
-        print ""
-        inserted=1
-        next
+p = Path(sys.argv[1])
+s = p.read_text()
+
+start = s.find("    # CIRGANTENG-PMA-START")
+end = s.find("    # CIRGANTENG-PMA-END")
+
+if start != -1 and end != -1:
+    end += len("    # CIRGANTENG-PMA-END")
+    s = s[:start] + s[end:]
+
+p.write_text(s)
+PY
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 diperlukan untuk update konfigurasi Nginx."
+fi
+
+python3 - "$SERVER_FILE" <<'PY'
+import sys
+import re
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+if "CIRGANTENG-PMA-START" in text:
+    raise SystemExit("Block PMA masih terdeteksi.")
+
+match = re.search(
+    r'(?m)^[ \t]*server\s*\{',
+    text
+)
+
+if not match:
+    raise SystemExit("Block server Nginx tidak ditemukan.")
+
+start = match.end()
+
+block = r'''
+    # CIRGANTENG-PMA-START
+
+    location = /pma {
+        return 301 /pma/;
     }
 
-    { print }
-    ' "$SERVER_FILE" > "$NGINX_TMP"
+    location ^~ /pma/ {
+        alias /usr/share/phpmyadmin/;
+        index index.php;
+    }
 
-    cp "$NGINX_TMP" "$SERVER_FILE"
-    rm -f "$NGINX_TMP"
+    location ~ ^/pma/(.+\.php)$ {
+        alias /usr/share/phpmyadmin/$1;
 
-    ok "Location /pma/ ditambahkan."
-fi
+        include fastcgi_params;
+
+        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;
+        fastcgi_param SCRIPT_NAME /pma/$1;
+
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+    }
+
+    # CIRGANTENG-PMA-END
+'''
+
+text = text[:start] + "\n" + block + text[start:]
+
+path.write_text(text)
+PY
+
+ok "Konfigurasi Nginx /pma/ dibuat."
 
 # ============================================================
 # TEST NGINX
@@ -291,10 +339,13 @@ fi
 log "Test konfigurasi Nginx..."
 
 if ! nginx -t; then
-    warn "Konfigurasi gagal. Memulihkan backup..."
+    warn "Nginx gagal. Mengembalikan backup..."
+
     cp -a "$BACKUP_FILE" "$SERVER_FILE"
+
     nginx -t || true
-    die "Konfigurasi Nginx gagal."
+
+    die "Konfigurasi Nginx gagal dan sudah dikembalikan."
 fi
 
 ok "Nginx syntax OK."
@@ -313,54 +364,35 @@ HTTP_CODE="$(
     curl -ksS \
         -o /dev/null \
         -w '%{http_code}' \
+        "https://127.0.0.1/pma/" \
         -H "Host: $DOMAIN" \
-        "https://127.0.0.1/pma/" 2>/dev/null || true
+    || true
 )"
 
-if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "301" && "$HTTP_CODE" != "302" ]]; then
-    HTTP_CODE="$(
-        curl -sS \
-            -o /dev/null \
-            -w '%{http_code}' \
-            -H "Host: $DOMAIN" \
-            "http://127.0.0.1/pma/" 2>/dev/null || true
-    )"
-fi
-
-if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
-    ok "phpMyAdmin local HTTP $HTTP_CODE."
+if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" ]]; then
+    ok "phpMyAdmin local HTTP $HTTP_CODE"
 else
-    warn "Test local menghasilkan HTTP $HTTP_CODE."
+    warn "HTTP local: $HTTP_CODE"
+    warn "Cek manual: curl -kI https://$DOMAIN/pma/"
 fi
-
-# ============================================================
-# HASIL
-# ============================================================
-
-SCHEME="http"
-
-if grep -qE 'listen[[:space:]]+443([^;]*ssl|[[:space:]]+ssl)' "$SERVER_FILE" 2>/dev/null; then
-    SCHEME="https"
-fi
-
-PMA_PUBLIC_URL="${SCHEME}://${DOMAIN}${PMA_PATH}/"
 
 echo
 echo "============================================================"
 echo "              INSTALLASI SELESAI"
 echo "============================================================"
-echo "Domain      : $DOMAIN"
-echo "phpMyAdmin  : $PMA_PUBLIC_URL"
-echo "PHP-FPM     : $PHP_FPM_SOCKET"
-echo "Directory   : $PMA_DIR"
-echo "Nginx       : $SERVER_FILE"
-echo "Backup      : $BACKUP_FILE"
+echo "phpMyAdmin : https://$DOMAIN/pma/"
+echo "Panel      : https://$DOMAIN"
+echo "PHP-FPM    : $PHP_FPM_SOCKET"
+echo "Directory  : $PMA_DIR"
+echo "Backup     : $BACKUP_FILE"
 echo
-echo "Login menggunakan USER DATABASE MariaDB/MySQL."
+echo "Login phpMyAdmin menggunakan USER DATABASE MariaDB/MySQL."
 echo
-echo "Tidak menggunakan:"
-echo "- Domain hardcoded"
-echo "- Port 8081"
-echo "- Apache"
-echo "- apt upgrade"
+echo "Catatan:"
+echo "- PHP CLI installer dipaksa menggunakan PHP 8.3."
+echo "- Extension dicek dengan extension_loaded()."
+echo "- Tidak menggunakan awk."
+echo "- Tidak menggunakan port 8081."
+echo "- Tidak menginstall Apache."
+echo "- Tidak menjalankan apt upgrade."
 echo "============================================================"
