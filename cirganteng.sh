@@ -15,7 +15,7 @@ die(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; exit 1; }
 [[ $EUID -eq 0 ]] || die "Jalankan sebagai root."
 
 echo "============================================================"
-echo "       CIRGANTENG - GENERIC PHPMYADMIN INSTALLER"
+echo "       CIRGANTENG - FINAL PHPMYADMIN INSTALLER - NO AWK - PHP 8.3"
 echo "============================================================"
 
 command -v nginx >/dev/null 2>&1 || die "Nginx belum terinstall."
