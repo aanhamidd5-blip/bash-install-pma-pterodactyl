@@ -165,9 +165,24 @@ log "Download phpMyAdmin stable..."
 
 rm -f "$PMA_ARCHIVE"
 
+PMA_VERSION="$(
+    curl -fsSL https://www.phpmyadmin.net/downloads/ |
+    grep -oE 'phpMyAdmin-[0-9]+\.[0-9]+\.[0-9]+' |
+    head -n1 |
+    sed 's/^phpMyAdmin-//'
+)"
+
+[[ -n "$PMA_VERSION" ]] ||
+    die "Versi phpMyAdmin tidak dapat dideteksi."
+
+PMA_URL="https://files.phpmyadmin.net/phpMyAdmin/${PMA_VERSION}/phpMyAdmin-${PMA_VERSION}-all-languages.tar.gz"
+
+log "Versi phpMyAdmin : $PMA_VERSION"
+log "URL download     : $PMA_URL"
+
 curl -fL --retry 3 \
     -o "$PMA_ARCHIVE" \
-    "https://files.phpmyadmin.net/phpMyAdmin/latest/phpMyAdmin-latest-all-languages.tar.gz" ||
+    "$PMA_URL" ||
     die "Download phpMyAdmin gagal."
 
 ok "Download berhasil."
