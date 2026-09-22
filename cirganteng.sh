@@ -1,558 +1,379 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
-# CIRGANTENG - FINAL PHPMYADMIN INSTALLER FOR PTERODACTYL
-# Ubuntu 22.04 / Nginx / PHP 8.3-FPM
-#
-# URL:
-#   https://PANEL-DOMAIN/pma/
-#
-# Tidak:
-#   - install Apache
-#   - apt upgrade
-#   - mengubah APP_URL Pterodactyl
-#   - membuat port baru
-#   - memakai port 8081
-# ============================================================
-
 PMA_DIR="/usr/share/phpmyadmin"
 PMA_TMP="/usr/share/phpmyadmin/tmp"
-PMA_DOWNLOAD="/tmp/phpmyadmin-latest.tar.gz"
+PMA_ARCHIVE="/tmp/phpmyadmin-latest.tar.gz"
 BACKUP_DIR="/root/cirganteng-pma-backups"
-NGINX_AVAILABLE="/etc/nginx/sites-available/pterodactyl.conf"
+PMA_PATH="/pma"
 
-PMA_URL_PATH="/pma/"
-PMA_DOWNLOAD_URL="https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz"
+log(){ echo -e "\033[1;36m[INFO]\033[0m $*"; }
+ok(){ echo -e "\033[1;32m[OK]\033[0m $*"; }
+warn(){ echo -e "\033[1;33m[WARNING]\033[0m $*"; }
+err(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; exit 1; }
 
-PHP_VERSION="8.3"
-PHP_FPM_SOCKET="/run/php/php8.3-fpm.sock"
-
-MARK_START="# CIRGANTENG-PMA-START"
-MARK_END="# CIRGANTENG-PMA-END"
-
-log() {
-    echo "[INFO] $*"
-}
-
-ok() {
-    echo "[OK] $*"
-}
-
-warn() {
-    echo "[WARNING] $*"
-}
-
-die() {
-    echo
-    echo "[ERROR] $*"
-    echo
-    exit 1
-}
-
-trap 'echo; echo "[ERROR] Installer berhenti pada baris $LINENO."; exit 1' ERR
-
-# ------------------------------------------------------------
-# ROOT
-# ------------------------------------------------------------
-
-if [[ "${EUID}" -ne 0 ]]; then
-    die "Jalankan sebagai root."
-fi
-
-clear
+[[ $EUID -eq 0 ]] || err "Jalankan installer sebagai root."
 
 echo "============================================================"
-echo "        CIRGANTENG - INSTALL PHPMYADMIN FINAL"
+echo "       CIRGANTENG - GENERIC PHPMYADMIN INSTALLER"
 echo "============================================================"
-echo
 
-# ------------------------------------------------------------
-# CEK PTERODACTYL
-# ------------------------------------------------------------
+command -v nginx >/dev/null 2>&1 || err "Nginx belum terinstall."
+systemctl is-active --quiet nginx || err "Nginx tidak aktif."
 
-if [[ ! -f "/var/www/pterodactyl/.env" ]]; then
-    die "File /var/www/pterodactyl/.env tidak ditemukan."
-fi
+ok "Nginx aktif."
 
-if [[ ! -f "$NGINX_AVAILABLE" ]]; then
-    die "Config Nginx Pterodactyl tidak ditemukan: $NGINX_AVAILABLE"
-fi
+mkdir -p "$BACKUP_DIR"
 
-# ------------------------------------------------------------
-# DETEKSI DOMAIN DARI APP_URL
-# ------------------------------------------------------------
+# ============================================================
+# DETEKSI CONFIG NGINX
+# ============================================================
 
-APP_URL="$(
-    grep -E '^APP_URL=' /var/www/pterodactyl/.env \
-    | tail -n1 \
-    | cut -d= -f2- \
-    | tr -d '"' \
-    | tr -d "'" \
-    | sed 's/[[:space:]]*$//'
-)"
+SERVER_FILE=""
 
-if [[ -z "$APP_URL" ]]; then
-    die "APP_URL tidak ditemukan di /var/www/pterodactyl/.env"
-fi
+for FILE in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [[ -f "$FILE" ]] || continue
 
-APP_URL="${APP_URL%/}"
-
-PANEL_DOMAIN="$(
-    printf '%s\n' "$APP_URL" \
-    | sed -E 's#^https?://##; s#/.*$##'
-)"
-
-if [[ -z "$PANEL_DOMAIN" ]]; then
-    die "Gagal mendeteksi domain panel dari APP_URL."
-fi
-
-PMA_PUBLIC_URL="${APP_URL}${PMA_URL_PATH}"
-
-ok "Panel domain : $PANEL_DOMAIN"
-ok "PMA URL      : $PMA_PUBLIC_URL"
-
-# ------------------------------------------------------------
-# CEK NGINX
-# ------------------------------------------------------------
-
-if ! command -v nginx >/dev/null 2>&1; then
-    die "Nginx tidak ditemukan."
-fi
-
-if ! systemctl is-active --quiet nginx; then
-    die "Nginx tidak aktif."
-fi
-
-ok "Nginx aktif"
-
-# ------------------------------------------------------------
-# CEK PHP
-# ------------------------------------------------------------
-
-if ! command -v php >/dev/null 2>&1; then
-    die "PHP tidak ditemukan."
-fi
-
-PHP_CLI_VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
-
-if [[ "$PHP_CLI_VERSION" != "$PHP_VERSION" ]]; then
-    warn "PHP CLI terdeteksi: $PHP_CLI_VERSION"
-    warn "Installer menargetkan PHP $PHP_VERSION."
-fi
-
-if [[ ! -S "$PHP_FPM_SOCKET" ]]; then
-    die "Socket PHP-FPM tidak ditemukan: $PHP_FPM_SOCKET"
-fi
-
-if ! systemctl is-active --quiet "php${PHP_VERSION}-fpm"; then
-    die "php${PHP_VERSION}-fpm tidak aktif."
-fi
-
-ok "PHP-FPM : $PHP_FPM_SOCKET"
-
-# ------------------------------------------------------------
-# CEK EXTENSION
-# ------------------------------------------------------------
-
-echo
-echo "[INFO] Cek extension PHP..."
-
-MISSING_EXT=()
-
-for EXT in mysqli mbstring zip; do
-    if php -m 2>/dev/null | grep -qi "^${EXT}$"; then
-        ok "Extension $EXT tersedia"
-    else
-        warn "Extension $EXT belum ditemukan."
-        MISSING_EXT+=("$EXT")
+    if grep -qE 'root[[:space:]]+/var/www/pterodactyl/public' "$FILE" 2>/dev/null; then
+        SERVER_FILE="$FILE"
+        break
     fi
 done
 
-# ------------------------------------------------------------
-# INSTALL EXTENSION YANG KURANG
-# HANYA PACKAGE PHP 8.3
-# TIDAK APT UPGRADE
-# ------------------------------------------------------------
+if [[ -z "$SERVER_FILE" ]]; then
+    for FILE in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [[ -f "$FILE" ]] || continue
 
-if [[ "${#MISSING_EXT[@]}" -gt 0 ]]; then
-    echo
-    log "Mencoba memasang extension PHP 8.3 yang diperlukan..."
+        if grep -qE 'server_name[[:space:]]+' "$FILE" 2>/dev/null; then
+            SERVER_FILE="$FILE"
+            break
+        fi
+    done
+fi
+
+[[ -n "$SERVER_FILE" ]] || err "Config server Nginx tidak ditemukan."
+
+ok "Config Nginx : $SERVER_FILE"
+
+# ============================================================
+# AUTO-DETECT DOMAIN
+# ============================================================
+
+DOMAIN="$(
+    awk '
+    /^[[:space:]]*server_name[[:space:]]+/ {
+        for (i=2; i<=NF; i++) {
+            gsub(/;/,"",$i)
+            if (
+                $i !~ /^_/ &&
+                $i !~ /^\$/ &&
+                $i != "localhost" &&
+                $i !~ /^\*/
+            ) {
+                print $i
+                exit
+            }
+        }
+    }' "$SERVER_FILE"
+)"
+
+[[ -n "$DOMAIN" ]] || err "Domain tidak ditemukan dari server_name Nginx."
+
+ok "Domain terdeteksi : $DOMAIN"
+
+# ============================================================
+# AUTO-DETECT PHP-FPM
+# ============================================================
+
+PHP_FPM_SOCKET=""
+
+for SOCK in /run/php/php*-fpm.sock; do
+    [[ -S "$SOCK" ]] || continue
+    PHP_FPM_SOCKET="$SOCK"
+done
+
+[[ -n "$PHP_FPM_SOCKET" ]] || err "Socket PHP-FPM tidak ditemukan."
+
+PHP_VERSION="$(
+    basename "$PHP_FPM_SOCKET" |
+    sed -E 's/^php([0-9.]+)-fpm\.sock$/\1/'
+)"
+
+ok "PHP-FPM : $PHP_VERSION"
+ok "Socket  : $PHP_FPM_SOCKET"
+
+PHP_BIN="php${PHP_VERSION}"
+
+if ! command -v "$PHP_BIN" >/dev/null 2>&1; then
+    PHP_BIN="php"
+fi
+
+# ============================================================
+# CEK / INSTALL EXTENSION
+# ============================================================
+
+log "Cek extension PHP..."
+
+MISSING=()
+
+for EXT in mysqli mbstring zip; do
+    if "$PHP_BIN" -m 2>/dev/null | grep -qi "^${EXT}$"; then
+        ok "Extension $EXT tersedia"
+    else
+        warn "Extension $EXT belum tersedia"
+        MISSING+=("$EXT")
+    fi
+done
+
+if (( ${#MISSING[@]} > 0 )); then
+    log "Menginstall extension PHP..."
 
     export DEBIAN_FRONTEND=noninteractive
-
-    apt-get update -o Acquire::Retries=3
+    apt-get update -y
 
     PACKAGES=()
 
-    for EXT in "${MISSING_EXT[@]}"; do
+    for EXT in "${MISSING[@]}"; do
         case "$EXT" in
             mysqli)
-                PACKAGES+=("php8.3-mysql")
+                PACKAGES+=("php${PHP_VERSION}-mysql")
                 ;;
             mbstring)
-                PACKAGES+=("php8.3-mbstring")
+                PACKAGES+=("php${PHP_VERSION}-mbstring")
                 ;;
             zip)
-                PACKAGES+=("php8.3-zip")
+                PACKAGES+=("php${PHP_VERSION}-zip")
                 ;;
         esac
     done
 
-    # Hapus duplikat package
-    mapfile -t PACKAGES < <(printf '%s\n' "${PACKAGES[@]}" | sort -u)
+    apt-get install -y "${PACKAGES[@]}"
 
-    apt-get install -y --no-install-recommends "${PACKAGES[@]}"
-
-    systemctl restart "php${PHP_VERSION}-fpm"
-
-    echo
-    log "Verifikasi extension..."
+    systemctl restart "php${PHP_VERSION}-fpm" 2>/dev/null || true
 
     for EXT in mysqli mbstring zip; do
-        if php -m 2>/dev/null | grep -qi "^${EXT}$"; then
-            ok "Extension $EXT aktif"
-        else
-            die "Extension $EXT masih belum aktif setelah instalasi."
-        fi
+        "$PHP_BIN" -m 2>/dev/null | grep -qi "^${EXT}$" ||
+            err "Extension $EXT masih belum aktif."
     done
-else
-    ok "Semua extension utama tersedia."
 fi
 
-# ------------------------------------------------------------
-# CEK TAR/CURL
-# ------------------------------------------------------------
+ok "Semua extension utama tersedia."
 
-command -v curl >/dev/null 2>&1 || die "curl tidak ditemukan."
-command -v tar >/dev/null 2>&1 || die "tar tidak ditemukan."
+# ============================================================
+# BACKUP CONFIG
+# ============================================================
 
-# ------------------------------------------------------------
-# BACKUP NGINX
-# ------------------------------------------------------------
+BACKUP_FILE="$BACKUP_DIR/$(basename "$SERVER_FILE").$(date +%Y%m%d-%H%M%S).bak"
 
-mkdir -p "$BACKUP_DIR"
+cp -a "$SERVER_FILE" "$BACKUP_FILE"
 
-BACKUP_FILE="$BACKUP_DIR/pterodactyl.conf.$(date +%Y%m%d-%H%M%S).bak"
+ok "Backup : $BACKUP_FILE"
 
-cp -a "$NGINX_AVAILABLE" "$BACKUP_FILE"
-
-ok "Backup:"
-echo "$BACKUP_FILE"
-
-# ------------------------------------------------------------
+# ============================================================
 # DOWNLOAD PHPMYADMIN
-# ------------------------------------------------------------
+# ============================================================
 
-echo
-echo "[1/8] Download phpMyAdmin stable..."
+log "Download phpMyAdmin stable..."
 
-rm -f "$PMA_DOWNLOAD"
+rm -f "$PMA_ARCHIVE"
 
-curl -fL --retry 3 --retry-delay 2 \
-    "$PMA_DOWNLOAD_URL" \
-    -o "$PMA_DOWNLOAD"
-
-if [[ ! -s "$PMA_DOWNLOAD" ]]; then
-    die "Download phpMyAdmin gagal."
-fi
+curl -fL --retry 3 \
+    -o "$PMA_ARCHIVE" \
+    "https://files.phpmyadmin.net/phpMyAdmin/latest/phpMyAdmin-latest-all-languages.tar.gz" ||
+    err "Download phpMyAdmin gagal."
 
 ok "Download berhasil."
 
-# ------------------------------------------------------------
-# VALIDASI TAR.GZ
-# ------------------------------------------------------------
-
-echo "[2/8] Validasi archive..."
-
-if ! tar -tzf "$PMA_DOWNLOAD" >/dev/null 2>&1; then
-    rm -f "$PMA_DOWNLOAD"
-    die "Archive phpMyAdmin tidak valid."
-fi
+tar -tzf "$PMA_ARCHIVE" >/dev/null 2>&1 ||
+    err "Archive phpMyAdmin tidak valid."
 
 ok "Archive valid."
 
-# ------------------------------------------------------------
-# EXTRACT KE TEMP
-# ------------------------------------------------------------
+# ============================================================
+# INSTALL PHPMYADMIN
+# ============================================================
 
-echo "[3/8] Extract phpMyAdmin..."
+log "Extract phpMyAdmin..."
 
-EXTRACT_DIR="/tmp/cirganteng-phpmyadmin-$$"
+TMP_EXTRACT="$(mktemp -d)"
 
-rm -rf "$EXTRACT_DIR"
-mkdir -p "$EXTRACT_DIR"
+tar -xzf "$PMA_ARCHIVE" -C "$TMP_EXTRACT"
 
-tar -xzf "$PMA_DOWNLOAD" -C "$EXTRACT_DIR"
+PMA_SOURCE="$(find "$TMP_EXTRACT" -maxdepth 1 -type d -name 'phpMyAdmin-*' | head -n1)"
 
-EXTRACTED_DIR="$(
-    find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d \
-    | head -n1
-)"
+[[ -d "$PMA_SOURCE" ]] || err "Folder phpMyAdmin tidak ditemukan."
 
-if [[ -z "$EXTRACTED_DIR" || ! -f "$EXTRACTED_DIR/index.php" ]]; then
-    rm -rf "$EXTRACT_DIR" "$PMA_DOWNLOAD"
-    die "Folder phpMyAdmin hasil extract tidak valid."
-fi
+rm -rf "$PMA_DIR"
 
-ok "Extract berhasil."
-
-# ------------------------------------------------------------
-# BACKUP INSTALASI LAMA JIKA ADA
-# ------------------------------------------------------------
-
-echo "[4/8] Siapkan directory phpMyAdmin..."
-
-if [[ -d "$PMA_DIR" ]]; then
-    OLD_BACKUP="$BACKUP_DIR/phpmyadmin-old-$(date +%Y%m%d-%H%M%S)"
-
-    mv "$PMA_DIR" "$OLD_BACKUP"
-
-    ok "Instalasi lama dipindahkan ke:"
-    echo "$OLD_BACKUP"
-fi
-
-mv "$EXTRACTED_DIR" "$PMA_DIR"
-
-rm -rf "$EXTRACT_DIR" "$PMA_DOWNLOAD"
-
-# ------------------------------------------------------------
-# TEMP DIRECTORY
-# ------------------------------------------------------------
+mkdir -p "$PMA_DIR"
+cp -a "$PMA_SOURCE"/. "$PMA_DIR"/
 
 mkdir -p "$PMA_TMP"
 
-chown -R root:root "$PMA_DIR"
 chown -R www-data:www-data "$PMA_TMP"
 
-chmod 755 "$PMA_DIR"
-chmod 770 "$PMA_TMP"
+rm -rf "$TMP_EXTRACT" "$PMA_ARCHIVE"
 
 ok "phpMyAdmin terpasang di $PMA_DIR"
 
-# ------------------------------------------------------------
-# CONFIG INC
-# ------------------------------------------------------------
+# ============================================================
+# CONFIG PHPMYADMIN
+# ============================================================
 
-echo "[5/8] Buat config phpMyAdmin..."
+BLOWFISH="$(
+    head -c 64 /dev/urandom |
+    base64 |
+    tr -dc 'A-Za-z0-9' |
+    head -c 32
+)"
 
-if [[ ! -f "$PMA_DIR/config.inc.php" ]]; then
-cat > "$PMA_DIR/config.inc.php" <<'PHP'
+cat > "$PMA_DIR/config.inc.php" <<PHP
 <?php
 
-declare(strict_types=1);
+\$cfg['blowfish_secret'] = '$BLOWFISH';
 
-/*
- * CIRGANTENG phpMyAdmin configuration
- */
+\$i = 0;
+\$i++;
 
-$cfg['blowfish_secret'] = 'CIRGANTENG-CHANGE-THIS-SECRET-32-CHARS';
+\$cfg['Servers'][\$i]['auth_type'] = 'cookie';
+\$cfg['Servers'][\$i]['host'] = '127.0.0.1';
+\$cfg['Servers'][\$i]['connect_type'] = 'tcp';
+\$cfg['Servers'][\$i]['compress'] = false;
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
 
-$i = 0;
-$i++;
-
-$cfg['Servers'][$i]['auth_type'] = 'cookie';
-$cfg['Servers'][$i]['host'] = 'localhost';
-$cfg['Servers'][$i]['connect_type'] = 'tcp';
-$cfg['Servers'][$i]['compress'] = false;
-$cfg['Servers'][$i]['AllowNoPassword'] = false;
-
-$cfg['TempDir'] = '/usr/share/phpmyadmin/tmp';
-
+\$cfg['TempDir'] = '$PMA_TMP';
 PHP
-fi
 
-# Generate secret acak 32 karakter
-SECRET="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 || true)"
-
-if [[ "${#SECRET}" -lt 32 ]]; then
-    SECRET="CIRGANTENG-$(date +%s)-$(printf '%s' "$RANDOM$RANDOM" | sha256sum | cut -c1-20)"
-fi
-
-sed -i \
-    "s#CIRGANTENG-CHANGE-THIS-SECRET-32-CHARS#$SECRET#" \
-    "$PMA_DIR/config.inc.php"
-
-chown root:www-data "$PMA_DIR/config.inc.php"
+chown www-data:www-data "$PMA_DIR/config.inc.php"
 chmod 640 "$PMA_DIR/config.inc.php"
 
 ok "config.inc.php siap."
 
-# ------------------------------------------------------------
-# HAPUS BLOCK CIRGANTENG LAMA
-# ------------------------------------------------------------
+# ============================================================
+# NGINX /PMA/
+# ============================================================
 
-echo "[6/8] Update konfigurasi Nginx..."
+if grep -qE 'location[[:space:]]+\^~[[:space:]]+/pma/' "$SERVER_FILE" 2>/dev/null ||
+   grep -qE 'location[[:space:]]+/pma/' "$SERVER_FILE" 2>/dev/null; then
 
-python3 - "$NGINX_AVAILABLE" <<'PY'
-import sys
-import re
+    warn "Location /pma/ sudah ada."
+else
 
-path = sys.argv[1]
+    NGINX_TMP="$(mktemp)"
 
-with open(path, "r", encoding="utf-8") as f:
-    data = f.read()
+    awk -v socket="$PHP_FPM_SOCKET" '
+    BEGIN { inserted=0 }
 
-start = "# CIRGANTENG-PMA-START"
-end = "# CIRGANTENG-PMA-END"
-
-pattern = re.escape(start) + r".*?" + re.escape(end) + r"\n?"
-
-data = re.sub(pattern, "", data, flags=re.S)
-
-with open(path, "w", encoding="utf-8") as f:
-    f.write(data)
-PY
-
-# ------------------------------------------------------------
-# INSERT PMA BLOCK SEBELUM PENUTUP SERVER
-# ------------------------------------------------------------
-
-python3 - "$NGINX_AVAILABLE" <<'PY'
-import sys
-
-path = sys.argv[1]
-
-with open(path, "r", encoding="utf-8") as f:
-    data = f.read()
-
-block = r'''
-    # CIRGANTENG-PMA-START
-
-    # /pma -> /pma/
-    location = /pma {
-        return 301 /pma/;
+    /^[[:space:]]*server[[:space:]]*\{/ && inserted==0 {
+        print
+        print ""
+        print "    # CIRGANTENG PHPMYADMIN"
+        print "    location /pma/ {"
+        print "        alias /usr/share/phpmyadmin/;"
+        print "        index index.php;"
+        print "        try_files $uri $uri/ /pma/index.php?$query_string;"
+        print "    }"
+        print ""
+        print "    location ~ ^/pma/(.+\\.php)$ {"
+        print "        alias /usr/share/phpmyadmin/$1;"
+        print "        include fastcgi_params;"
+        print "        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;"
+        print "        fastcgi_param SCRIPT_NAME /pma/$1;"
+        print "        fastcgi_pass unix:" socket ";"
+        print "    }"
+        print ""
+        inserted=1
+        next
     }
 
-    # phpMyAdmin utama
-    location = /pma/ {
-        include fastcgi_params;
+    { print }
+    ' "$SERVER_FILE" > "$NGINX_TMP"
 
-        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/index.php;
-        fastcgi_param SCRIPT_NAME /pma/index.php;
-        fastcgi_param DOCUMENT_ROOT /usr/share/phpmyadmin;
-        fastcgi_param REQUEST_URI $request_uri;
+    cp "$NGINX_TMP" "$SERVER_FILE"
+    rm -f "$NGINX_TMP"
 
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-    }
-
-    # PHP phpMyAdmin lainnya
-    location ~ ^/pma/(.+\.php)$ {
-        include fastcgi_params;
-
-        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;
-        fastcgi_param SCRIPT_NAME /pma/$1;
-        fastcgi_param DOCUMENT_ROOT /usr/share/phpmyadmin;
-        fastcgi_param REQUEST_URI $request_uri;
-
-        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
-    }
-
-    # CSS / JS / image / static files
-    location /pma/ {
-        alias /usr/share/phpmyadmin/;
-    }
-
-    # CIRGANTENG-PMA-END
-'''
-
-# Cari penutup server terakhir.
-pos = data.rfind("}")
-
-if pos == -1:
-    raise SystemExit("Tidak menemukan penutup server block Nginx.")
-
-data = data[:pos] + block + "\n" + data[pos:]
-
-with open(path, "w", encoding="utf-8") as f:
-    f.write(data)
-PY
-
-# ------------------------------------------------------------
-# NGINX TEST
-# ------------------------------------------------------------
-
-echo "[7/8] Test konfigurasi Nginx..."
-
-if ! nginx -t; then
-    echo
-    echo "[ERROR] Nginx config gagal."
-    echo "[INFO] Restore backup:"
-    echo "$BACKUP_FILE"
-
-    cp -a "$BACKUP_FILE" "$NGINX_AVAILABLE"
-    nginx -t || true
-
-    exit 1
+    ok "Location /pma/ ditambahkan."
 fi
 
-ok "Nginx syntax OK."
+# ============================================================
+# TEST NGINX
+# ============================================================
+
+log "Test konfigurasi Nginx..."
+
+if nginx -t; then
+    ok "Nginx syntax OK."
+else
+    cp -a "$BACKUP_FILE" "$SERVER_FILE"
+    nginx -t || true
+    err "Konfigurasi Nginx gagal. Backup dipulihkan."
+fi
 
 systemctl reload nginx
 
 ok "Nginx reload berhasil."
 
-# ------------------------------------------------------------
-# TEST LOCAL
-# ------------------------------------------------------------
+# ============================================================
+# LOCAL TEST
+# ============================================================
 
-echo "[8/8] Test phpMyAdmin local..."
+log "Test phpMyAdmin local..."
 
-sleep 2
-
-LOCAL_HEADERS="$(
-    curl -sS \
-        --max-time 15 \
-        -H "Host: $PANEL_DOMAIN" \
-        -D - \
-        -o /tmp/cirganteng-pma-test.html \
-        "http://127.0.0.1/pma/" \
-    || true
+HTTP_CODE="$(
+    curl -ksS \
+        -o /dev/null \
+        -w '%{http_code}' \
+        -H "Host: $DOMAIN" \
+        "https://127.0.0.1/pma/" 2>/dev/null || true
 )"
 
-if grep -qE '^HTTP/[0-9.]+ 200 ' <<< "$LOCAL_HEADERS"; then
-    ok "phpMyAdmin local HTTP 200."
-elif grep -qE '^HTTP/[0-9.]+ 30[127] ' <<< "$LOCAL_HEADERS"; then
-    ok "phpMyAdmin local redirect terdeteksi."
+if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
+    ok "phpMyAdmin local HTTP $HTTP_CODE."
 else
-    echo
-    warn "Response local tidak 200/redirect."
+    HTTP_CODE="$(
+        curl -sS \
+            -o /dev/null \
+            -w '%{http_code}' \
+            -H "Host: $DOMAIN" \
+            "http://127.0.0.1/pma/" 2>/dev/null || true
+    )"
 
-    echo
-    echo "=== RESPONSE ==="
-    echo "$LOCAL_HEADERS"
-
-    echo
-    echo "=== NGINX ERROR TERAKHIR ==="
-    tail -n 30 /var/log/nginx/pterodactyl.app-error.log 2>/dev/null || true
-
-    echo
-    warn "Instalasi tetap selesai, tetapi test lokal perlu diperiksa."
+    if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
+        ok "phpMyAdmin local HTTP $HTTP_CODE."
+    else
+        warn "Test local menghasilkan HTTP $HTTP_CODE."
+    fi
 fi
 
-# ------------------------------------------------------------
-# CLEAN
-# ------------------------------------------------------------
+# ============================================================
+# SELESAI
+# ============================================================
 
-rm -f /tmp/cirganteng-pma-test.html
+SCHEME="http"
+
+if nginx -T 2>/dev/null |
+    grep -qE 'listen[[:space:]]+443([^;]*ssl|[[:space:]]+ssl)'; then
+    SCHEME="https"
+fi
+
+PMA_PUBLIC_URL="${SCHEME}://${DOMAIN}${PMA_PATH}/"
 
 echo
 echo "============================================================"
 echo "              INSTALLASI SELESAI"
 echo "============================================================"
+echo "Domain      : $DOMAIN"
+echo "phpMyAdmin  : $PMA_PUBLIC_URL"
+echo "PHP-FPM     : $PHP_FPM_SOCKET"
+echo "Directory   : $PMA_DIR"
+echo "Nginx       : $SERVER_FILE"
+echo "Backup      : $BACKUP_FILE"
 echo
-echo "phpMyAdmin : $PMA_PUBLIC_URL"
-echo "Panel      : $APP_URL"
-echo "PHP-FPM    : $PHP_FPM_SOCKET"
-echo "Directory  : $PMA_DIR"
-echo "Backup     : $BACKUP_FILE"
+echo "Login menggunakan USER DATABASE MariaDB/MySQL."
 echo
-echo "Login phpMyAdmin menggunakan USER DATABASE MariaDB/MySQL."
-echo
-echo "Catatan:"
-echo "- Tidak menggunakan port 8081."
-echo "- Tidak menginstall Apache."
-echo "- Tidak menjalankan apt upgrade."
-echo "- Cloudflare dapat menampilkan challenge pada /pma/."
-echo
+echo "Tidak menggunakan:"
+echo "- Domain hardcoded"
+echo "- Port 8081"
+echo "- Apache"
+echo "- apt upgrade"
 echo "============================================================"
