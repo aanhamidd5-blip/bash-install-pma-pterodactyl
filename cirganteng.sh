@@ -52,8 +52,10 @@ DOMAIN="$(
     grep -hE '^[[:space:]]*server_name[[:space:]]+' "$SERVER_FILE" 2>/dev/null |
     head -n1 |
     sed -E 's/^[[:space:]]*server_name[[:space:]]+//' |
-    tr ';' ' ' |
-    awk '{print $1}'
+    sed 's/;.*//' |
+    sed -E 's/[[:space:]].*$//' |
+    sed 's/^\\*\\.//' |
+    sed 's/[[:space:]]//g'
 )"
 
 [[ -n "$DOMAIN" ]] || die "Domain tidak ditemukan dari server_name."
@@ -87,10 +89,10 @@ PHP_VERSION="$(
 
 [[ -n "$PHP_VERSION" ]] || die "Versi PHP-FPM tidak dapat dideteksi."
 
-PHP_BIN="php${PHP_VERSION}"
+PHP_BIN="/usr/bin/php8.3"
 
-if ! command -v "$PHP_BIN" >/dev/null 2>&1; then
-    PHP_BIN="php"
+if [[ ! -x "$PHP_BIN" ]]; then
+    die "PHP 8.3 CLI tidak ditemukan: $PHP_BIN"
 fi
 
 ok "PHP-FPM : $PHP_VERSION"
@@ -105,7 +107,7 @@ log "Cek extension PHP..."
 MISSING=()
 
 for EXT in mysqli mbstring zip; do
-    if "$PHP_BIN" -m 2>/dev/null | grep -qi "^${EXT}$"; then
+    if /usr/bin/php8.3 -m 2>/dev/null | grep -qi "^${EXT}$"; then
         ok "Extension $EXT tersedia"
     else
         warn "Extension $EXT belum tersedia"
@@ -146,7 +148,7 @@ if (( ${#MISSING[@]} > 0 )); then
     log "Verifikasi extension..."
 
     for EXT in mysqli mbstring zip; do
-        "$PHP_BIN" -m 2>/dev/null | grep -qi "^${EXT}$" ||
+        /usr/bin/php8.3 -m 2>/dev/null | grep -qi "^${EXT}$" ||
             die "Extension $EXT masih belum aktif setelah instalasi."
     done
 fi
