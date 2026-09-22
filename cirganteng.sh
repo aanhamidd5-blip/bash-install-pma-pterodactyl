@@ -10,16 +10,16 @@ PMA_PATH="/pma"
 log(){ echo -e "\033[1;36m[INFO]\033[0m $*"; }
 ok(){ echo -e "\033[1;32m[OK]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[WARNING]\033[0m $*"; }
-err(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; exit 1; }
+die(){ echo -e "\033[1;31m[ERROR]\033[0m $*"; exit 1; }
 
-[[ $EUID -eq 0 ]] || err "Jalankan installer sebagai root."
+[[ $EUID -eq 0 ]] || die "Jalankan sebagai root."
 
 echo "============================================================"
 echo "       CIRGANTENG - GENERIC PHPMYADMIN INSTALLER"
 echo "============================================================"
 
-command -v nginx >/dev/null 2>&1 || err "Nginx belum terinstall."
-systemctl is-active --quiet nginx || err "Nginx tidak aktif."
+command -v nginx >/dev/null 2>&1 || die "Nginx belum terinstall."
+systemctl is-active --quiet nginx || die "Nginx tidak aktif."
 
 ok "Nginx aktif."
 
@@ -34,55 +34,40 @@ SERVER_FILE=""
 for FILE in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
     [[ -f "$FILE" ]] || continue
 
-    if grep -qE 'root[[:space:]]+/var/www/pterodactyl/public' "$FILE" 2>/dev/null; then
+    if grep -qE 'server_name[[:space:]]+' "$FILE" 2>/dev/null; then
         SERVER_FILE="$FILE"
         break
     fi
 done
 
-if [[ -z "$SERVER_FILE" ]]; then
-    for FILE in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
-        [[ -f "$FILE" ]] || continue
-
-        if grep -qE 'server_name[[:space:]]+' "$FILE" 2>/dev/null; then
-            SERVER_FILE="$FILE"
-            break
-        fi
-    done
-fi
-
-[[ -n "$SERVER_FILE" ]] || err "Config server Nginx tidak ditemukan."
+[[ -n "$SERVER_FILE" ]] || die "Config Nginx dengan server_name tidak ditemukan."
 
 ok "Config Nginx : $SERVER_FILE"
 
 # ============================================================
-# AUTO-DETECT DOMAIN
+# DETEKSI DOMAIN - SEDERHANA
 # ============================================================
 
 DOMAIN="$(
-    awk '
-    /^[[:space:]]*server_name[[:space:]]+/ {
-        for (i=2; i<=NF; i++) {
-            gsub(/;/,"",$i)
-            if (
-                $i !~ /^_/ &&
-                $i !~ /^\$/ &&
-                $i != "localhost" &&
-                $i !~ /^\*/
-            ) {
-                print $i
-                exit
-            }
-        }
-    }' "$SERVER_FILE"
+    grep -hE '^[[:space:]]*server_name[[:space:]]+' "$SERVER_FILE" 2>/dev/null |
+    head -n1 |
+    sed -E 's/^[[:space:]]*server_name[[:space:]]+//' |
+    tr ';' ' ' |
+    awk '{print $1}'
 )"
 
-[[ -n "$DOMAIN" ]] || err "Domain tidak ditemukan dari server_name Nginx."
+[[ -n "$DOMAIN" ]] || die "Domain tidak ditemukan dari server_name."
+
+case "$DOMAIN" in
+    "_"|"localhost"|"127.0.0.1"|"\$"*|"*")
+        die "server_name tidak berisi domain publik: $DOMAIN"
+        ;;
+esac
 
 ok "Domain terdeteksi : $DOMAIN"
 
 # ============================================================
-# AUTO-DETECT PHP-FPM
+# DETEKSI PHP-FPM
 # ============================================================
 
 PHP_FPM_SOCKET=""
@@ -90,17 +75,17 @@ PHP_FPM_SOCKET=""
 for SOCK in /run/php/php*-fpm.sock; do
     [[ -S "$SOCK" ]] || continue
     PHP_FPM_SOCKET="$SOCK"
+    break
 done
 
-[[ -n "$PHP_FPM_SOCKET" ]] || err "Socket PHP-FPM tidak ditemukan."
+[[ -n "$PHP_FPM_SOCKET" ]] || die "Socket PHP-FPM tidak ditemukan."
 
 PHP_VERSION="$(
     basename "$PHP_FPM_SOCKET" |
     sed -E 's/^php([0-9.]+)-fpm\.sock$/\1/'
 )"
 
-ok "PHP-FPM : $PHP_VERSION"
-ok "Socket  : $PHP_FPM_SOCKET"
+[[ -n "$PHP_VERSION" ]] || die "Versi PHP-FPM tidak dapat dideteksi."
 
 PHP_BIN="php${PHP_VERSION}"
 
@@ -108,8 +93,11 @@ if ! command -v "$PHP_BIN" >/dev/null 2>&1; then
     PHP_BIN="php"
 fi
 
+ok "PHP-FPM : $PHP_VERSION"
+ok "Socket  : $PHP_FPM_SOCKET"
+
 # ============================================================
-# CEK / INSTALL EXTENSION
+# CEK EXTENSION
 # ============================================================
 
 log "Cek extension PHP..."
@@ -125,11 +113,15 @@ for EXT in mysqli mbstring zip; do
     fi
 done
 
+# ============================================================
+# INSTALL EXTENSION
+# ============================================================
+
 if (( ${#MISSING[@]} > 0 )); then
-    log "Menginstall extension PHP..."
+    log "Menginstall extension PHP ${PHP_VERSION}..."
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
+    apt-get update -o Acquire::Retries=3
 
     PACKAGES=()
 
@@ -147,20 +139,22 @@ if (( ${#MISSING[@]} > 0 )); then
         esac
     done
 
-    apt-get install -y "${PACKAGES[@]}"
+    apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 
-    systemctl restart "php${PHP_VERSION}-fpm" 2>/dev/null || true
+    systemctl restart "php${PHP_VERSION}-fpm"
+
+    log "Verifikasi extension..."
 
     for EXT in mysqli mbstring zip; do
         "$PHP_BIN" -m 2>/dev/null | grep -qi "^${EXT}$" ||
-            err "Extension $EXT masih belum aktif."
+            die "Extension $EXT masih belum aktif setelah instalasi."
     done
 fi
 
 ok "Semua extension utama tersedia."
 
 # ============================================================
-# BACKUP CONFIG
+# BACKUP NGINX
 # ============================================================
 
 BACKUP_FILE="$BACKUP_DIR/$(basename "$SERVER_FILE").$(date +%Y%m%d-%H%M%S).bak"
@@ -180,12 +174,12 @@ rm -f "$PMA_ARCHIVE"
 curl -fL --retry 3 \
     -o "$PMA_ARCHIVE" \
     "https://files.phpmyadmin.net/phpMyAdmin/latest/phpMyAdmin-latest-all-languages.tar.gz" ||
-    err "Download phpMyAdmin gagal."
+    die "Download phpMyAdmin gagal."
 
 ok "Download berhasil."
 
 tar -tzf "$PMA_ARCHIVE" >/dev/null 2>&1 ||
-    err "Archive phpMyAdmin tidak valid."
+    die "Archive phpMyAdmin tidak valid."
 
 ok "Archive valid."
 
@@ -193,15 +187,13 @@ ok "Archive valid."
 # INSTALL PHPMYADMIN
 # ============================================================
 
-log "Extract phpMyAdmin..."
-
 TMP_EXTRACT="$(mktemp -d)"
 
 tar -xzf "$PMA_ARCHIVE" -C "$TMP_EXTRACT"
 
 PMA_SOURCE="$(find "$TMP_EXTRACT" -maxdepth 1 -type d -name 'phpMyAdmin-*' | head -n1)"
 
-[[ -d "$PMA_SOURCE" ]] || err "Folder phpMyAdmin tidak ditemukan."
+[[ -d "$PMA_SOURCE" ]] || die "Folder phpMyAdmin tidak ditemukan."
 
 rm -rf "$PMA_DIR"
 
@@ -209,7 +201,6 @@ mkdir -p "$PMA_DIR"
 cp -a "$PMA_SOURCE"/. "$PMA_DIR"/
 
 mkdir -p "$PMA_TMP"
-
 chown -R www-data:www-data "$PMA_TMP"
 
 rm -rf "$TMP_EXTRACT" "$PMA_ARCHIVE"
@@ -253,12 +244,9 @@ ok "config.inc.php siap."
 # NGINX /PMA/
 # ============================================================
 
-if grep -qE 'location[[:space:]]+\^~[[:space:]]+/pma/' "$SERVER_FILE" 2>/dev/null ||
-   grep -qE 'location[[:space:]]+/pma/' "$SERVER_FILE" 2>/dev/null; then
-
-    warn "Location /pma/ sudah ada."
+if grep -qE 'location[[:space:]]+(/|\^~[[:space:]]*)/pma/' "$SERVER_FILE" 2>/dev/null; then
+    warn "Location /pma/ sudah ada. Tidak dibuat ulang."
 else
-
     NGINX_TMP="$(mktemp)"
 
     awk -v socket="$PHP_FPM_SOCKET" '
@@ -268,10 +256,9 @@ else
         print
         print ""
         print "    # CIRGANTENG PHPMYADMIN"
-        print "    location /pma/ {"
+        print "    location ^~ /pma/ {"
         print "        alias /usr/share/phpmyadmin/;"
         print "        index index.php;"
-        print "        try_files $uri $uri/ /pma/index.php?$query_string;"
         print "    }"
         print ""
         print "    location ~ ^/pma/(.+\\.php)$ {"
@@ -301,20 +288,21 @@ fi
 
 log "Test konfigurasi Nginx..."
 
-if nginx -t; then
-    ok "Nginx syntax OK."
-else
+if ! nginx -t; then
+    warn "Konfigurasi gagal. Memulihkan backup..."
     cp -a "$BACKUP_FILE" "$SERVER_FILE"
     nginx -t || true
-    err "Konfigurasi Nginx gagal. Backup dipulihkan."
+    die "Konfigurasi Nginx gagal."
 fi
+
+ok "Nginx syntax OK."
 
 systemctl reload nginx
 
 ok "Nginx reload berhasil."
 
 # ============================================================
-# LOCAL TEST
+# TEST LOCAL
 # ============================================================
 
 log "Test phpMyAdmin local..."
@@ -327,9 +315,7 @@ HTTP_CODE="$(
         "https://127.0.0.1/pma/" 2>/dev/null || true
 )"
 
-if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
-    ok "phpMyAdmin local HTTP $HTTP_CODE."
-else
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "301" && "$HTTP_CODE" != "302" ]]; then
     HTTP_CODE="$(
         curl -sS \
             -o /dev/null \
@@ -337,22 +323,21 @@ else
             -H "Host: $DOMAIN" \
             "http://127.0.0.1/pma/" 2>/dev/null || true
     )"
+fi
 
-    if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
-        ok "phpMyAdmin local HTTP $HTTP_CODE."
-    else
-        warn "Test local menghasilkan HTTP $HTTP_CODE."
-    fi
+if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
+    ok "phpMyAdmin local HTTP $HTTP_CODE."
+else
+    warn "Test local menghasilkan HTTP $HTTP_CODE."
 fi
 
 # ============================================================
-# SELESAI
+# HASIL
 # ============================================================
 
 SCHEME="http"
 
-if nginx -T 2>/dev/null |
-    grep -qE 'listen[[:space:]]+443([^;]*ssl|[[:space:]]+ssl)'; then
+if grep -qE 'listen[[:space:]]+443([^;]*ssl|[[:space:]]+ssl)' "$SERVER_FILE" 2>/dev/null; then
     SCHEME="https"
 fi
 
